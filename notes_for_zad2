@@ -1,0 +1,36 @@
+Prime factors are the prime numbers that, when multiplied together, give a specific number. A prime number is a natural number greater than 1 that cannot be formed by multiplying two smaller natural numbers.
+For example, let's break down the prime factorization of some numbers:
+
+12:
+
+12 = 2 × 2 × 3
+Prime factors: 2 (appears twice) and 3
+We write this as 2² × 3
+
+
+30:
+
+30 = 2 × 3 × 5
+Prime factors: 2, 3, and 5
+
+
+100:
+
+100 = 2 × 2 × 5 × 5
+Prime factors: 2 (twice) and 5 (twice)
+We write this as 2² × 5²
+
+
+
+In our subset product problem, we use prime factorization to convert a multiplication problem into an addition problem:
+
+Instead of finding numbers whose product equals the target, we look for numbers whose combined prime factors match the target's prime factorization
+For example, if our target has the prime factorization 2³ × 3² × 5, we need to select numbers whose prime factors, when combined, give exactly 3 factors of 2, 2 factors of 3, and 1 factor of 5
+
+This approach works well with the Clingo solver because:
+
+It avoids integer overflow with large numbers
+It converts multiplication (finding products) into addition (counting factors)
+It allows us to precisely model the constraints of the problem
+
+The prime factorization is unique for every number, which is why this approach guarantees finding the correct subset whose product equals the target.
