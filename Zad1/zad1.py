@@ -1,526 +1,277 @@
-#!/usr/bin/env python3
-"""
-Final AutID Solver - Uses a completely different approach to encode DFA constraints for Z3
-"""
-import z3
+from ortools.linear_solver import pywraplp
 import sys
 import time
-import argparse
+import re
+from collections import defaultdict
+
+######################
+# TRIE IMPLEMENTATION
+######################
 
 
-def read_data(filepath):
-    """
-    Read data from file in the specified format
-    """
-    with open(filepath, 'r') as f:
-        # Read alphabet
-        alphabet_line = f.readline().strip()
-        if alphabet_line.startswith("Alphabet:"):
-            alphabet = alphabet_line[len("Alphabet:"):].strip().split()
+class TrieNode:
+    def __init__(self):
+        self.children = {}  # key: symbol, value: TrieNode
+        # List of booleans for strings ending at this node (True = accept, False = reject)
+        self.outcomes = []
+
+
+def build_trie(accepted, rejected):
+    root = TrieNode()
+    # Track which strings have been inserted
+    inserted = set()
+
+    def insert(word, outcome):
+        node = root
+        for ch in word:
+            if ch not in node.children:
+                node.children[ch] = TrieNode()
+            node = node.children[ch]
+        # Check for conflicts
+        if word in inserted and (outcome not in node.outcomes):
+            print(f"Warning: Conflicting outcomes for string '{word}'")
+        node.outcomes.append(outcome)
+        inserted.add(word)
+
+    for s in accepted:
+        insert(s, True)
+    for t in rejected:
+        insert(t, False)
+    return root
+
+##############################
+# PARSING AND PREPARATION CODE
+##############################
+
+
+def parse_input_file(input_file):
+    """Parse input file with robust error handling."""
+    try:
+        with open(input_file, 'r') as f:
+            content = f.read().strip()
+
+        # Split lines and remove empty lines
+        lines = [line.strip() for line in content.split('\n') if line.strip()]
+
+        # Parse alphabet (Note: header "Alfabet:" is used)
+        alphabet_match = re.match(
+            r'^Alfabet:\s*([^\s]+)', lines[0], re.IGNORECASE)
+        if alphabet_match:
+            alphabet = list(alphabet_match.group(1))
         else:
-            alphabet = alphabet_line.strip().split()
+            alphabet = ['0', '1']  # default alphabet
 
-        # Read k_max
-        k_max = int(f.readline().strip())
+        # Parse K (max states)
+        k_match = re.match(r'^maximum_k_value:\s*(\d+)',
+                           lines[1], re.IGNORECASE)
+        K = int(k_match.group(1)) if k_match else 10
 
-        # Read accepting strings
-        num_accepting = int(f.readline().strip())
-        accepting = []
-        for _ in range(num_accepting):
-            accepting.append(f.readline().strip())
-
-        # Read rejecting strings
-        num_rejecting = int(f.readline().strip())
-        rejecting = []
-        for _ in range(num_rejecting):
-            rejecting.append(f.readline().strip())
-
-    return alphabet, k_max, accepting, rejecting
-
-
-def solve_automaton(alphabet, accepting, rejecting, num_states, timeout=600):
-    """
-    Completely rewritten approach that avoids using Z3 expressions as dictionary keys.
-    """
-    print(
-        f"Attempting to find DFA with {num_states} states (timeout: {timeout}s)...")
-
-    # Set timeout for Z3
-    z3.set_param('timeout', timeout * 1000)  # in milliseconds
-
-    # Create solver
-    solver = z3.Solver()
-
-    # Create transition function as a 2D array (state x symbol)
-    # delta[q][a_idx] represents the state reached from q on input alphabet[a_idx]
-    delta = []
-    for q in range(num_states):
-        row = []
-        for a_idx in range(len(alphabet)):
-            var = z3.Int(f"delta_{q}_{a_idx}")
-            solver.add(var >= 0)
-            solver.add(var < num_states)
-            row.append(var)
-        delta.append(row)
-
-    # Create final state variables
-    is_final = [z3.Bool(f"final_{q}") for q in range(num_states)]
-
-    # Map alphabet symbols to indices for easier reference
-    alpha_to_idx = {a: i for i, a in enumerate(alphabet)}
-
-    # Helper function to create constraints for a string
-    def add_string_constraints(string, should_accept):
-        # For empty string, constrain initial state
-        if not string:
-            if should_accept:
-                solver.add(is_final[0])
+        # Parse accepted and rejected strings
+        accepted = []
+        rejected = []
+        current_section = None
+        for line in lines[2:]:
+            if re.match(r'^accepting_strings_S:', line, re.IGNORECASE):
+                current_section = 'S'
+                continue
+            elif re.match(r'^rejecting_strings_T:', line, re.IGNORECASE):
+                current_section = 'T'
+                continue
+            if current_section is None:
+                continue
+            # Split comma-separated strings
+            strings = [s.strip() for s in line.split(',') if s.strip()]
+            valid_strings = [s for s in strings if all(
+                ch in alphabet for ch in s)]
+            if current_section == 'S':
+                accepted.extend(valid_strings)
             else:
-                solver.add(z3.Not(is_final[0]))
-            return
+                rejected.extend(valid_strings)
 
-        # For non-empty strings, compute the end state
-        end_state = compute_end_state(string)
+        print(f"\n=== Parsed Problem Instance ===")
+        print(f"Alphabet: {alphabet}")
+        print(f"Maximum K: {K}")
+        print(f"Accept strings: {len(accepted)}")
+        print(f"Reject strings: {len(rejected)}")
+        return alphabet, K, accepted, rejected
 
-        # Add constraint for final state
-        if should_accept:
-            solver.add(is_final[end_state])
+    except Exception as e:
+        print(f"Error parsing input file: {e}")
+        return None, None, None, None
+
+#################################
+# MILP SOLVER WITH TRIE GROUPING
+#################################
+
+
+class DFAConstructionSolver:
+    def __init__(self, alphabet, max_states, accept_strings, reject_strings):
+        self.alphabet = alphabet
+        self.max_states = max_states
+        self.accept_strings = accept_strings
+        self.reject_strings = reject_strings
+        # Build a trie that groups common prefixes.
+        self.trie_root = build_trie(accept_strings, reject_strings)
+
+    def solve_with_milp(self):
+        solver = pywraplp.Solver.CreateSolver(
+            'SCIP_MIXED_INTEGER_PROGRAMMING')
+        if not solver:
+            print("MILP solver not available.")
+            return None, None
+
+        # Set solver parameters (adjust as needed)
+        solver.SetNumThreads(8)
+        solver.SetTimeLimit(300000)  # 5 minutes
+        # (Additional parameters might be set if using a commercial solver like Gurobi/CPLEX)
+
+        K = self.max_states
+        alphabet = self.alphabet
+
+        # 1. Transition variables:
+        # For each state q and symbol a, T_vars[(q,a,q2)]=1 if the DFA transitions from state q to state q2 on symbol a.
+        T_vars = {}
+        for q in range(K):
+            for a in alphabet:
+                vars_for_transition = []
+                for q2 in range(K):
+                    T_vars[(q, a, q2)] = solver.IntVar(0, 1, f"T_{q}_{a}_{q2}")
+                    vars_for_transition.append(T_vars[(q, a, q2)])
+                solver.Add(solver.Sum(vars_for_transition) == 1)
+
+        # 2. Accepting state variables:
+        is_accepting = {}
+        for q in range(K):
+            is_accepting[q] = solver.IntVar(0, 1, f"is_accepting_{q}")
+        if self.accept_strings:
+            solver.Add(solver.Sum([is_accepting[q] for q in range(K)]) >= 1)
+
+        # 3. Simulation constraints using the trie.
+        # For each trie node, we will have a variable that indicates the state of the DFA after reading that prefix.
+        # We use a dictionary mapping node IDs to a dictionary of state indicator variables.
+        x_vars = {}  # key: node id, value: dict mapping state q to variable
+
+        # To traverse the trie, assign each node a unique id.
+        node_id_counter = [0]
+
+        def assign_ids(node):
+            node.id = node_id_counter[0]
+            node_id_counter[0] += 1
+            for child in node.children.values():
+                assign_ids(child)
+        assign_ids(self.trie_root)
+
+        # Create x_vars for each node in the trie.
+        def create_x_vars(node):
+            x_vars[node.id] = {}
+            for q in range(K):
+                x_vars[node.id][q] = solver.IntVar(
+                    0, 1, f"x_node{node.id}_{q}")
+            for child in node.children.values():
+                create_x_vars(child)
+        create_x_vars(self.trie_root)
+
+        # The root must be state 0.
+        solver.Add(x_vars[self.trie_root.id][0] == 1)
+        for q in range(1, K):
+            solver.Add(x_vars[self.trie_root.id][q] == 0)
+        # At each node, exactly one state is active.
+        for node_id, state_vars in x_vars.items():
+            solver.Add(solver.Sum([state_vars[q] for q in range(K)]) == 1)
+
+        # Now, add transition simulation constraints along each trie edge.
+        # For each node and each child corresponding to symbol 'a', simulate transition.
+        y_vars = {}  # auxiliary variables to linearize product.
+
+        def add_transition_constraints(parent):
+            parent_id = parent.id
+            for a, child in parent.children.items():
+                child_id = child.id
+                # For each possible transition from parent's state q to child's state q2 on symbol a.
+                for q in range(K):
+                    for q2 in range(K):
+                        y_vars[(parent_id, child_id, q, q2)] = solver.IntVar(
+                            0, 1, f"y_{parent_id}_{child_id}_{q}_{q2}")
+                        # Linearize y = x(parent,q) * T_vars[(q,a,q2)]
+                        solver.Add(
+                            y_vars[(parent_id, child_id, q, q2)] <= x_vars[parent_id][q])
+                        solver.Add(
+                            y_vars[(parent_id, child_id, q, q2)] <= T_vars[(q, a, q2)])
+                        solver.Add(y_vars[(parent_id, child_id, q, q2)] >=
+                                   x_vars[parent_id][q] + T_vars[(q, a, q2)] - 1)
+                # Enforce that the child node's state variable is the sum over y_vars.
+                for q2 in range(K):
+                    solver.Add(x_vars[child_id][q2] ==
+                               solver.Sum([y_vars[(parent_id, child_id, q, q2)] for q in range(K)]))
+                # Recursively add constraints for the child.
+                add_transition_constraints(child)
+        add_transition_constraints(self.trie_root)
+
+        # 4. Final-state constraints: For every trie node that is a leaf (has outcomes), enforce the outcome.
+        def add_final_constraints(node):
+            if node.outcomes:
+                for q in range(K):
+                    # If this node contains any accepted strings and the DFA is in state q,
+                    # then state q must be accepting
+                    if any(outcome for outcome in node.outcomes):
+                        # x_vars[node.id][q] = 1 => is_accepting[q] = 1
+                        # This is equivalent to x_vars[node.id][q] <= is_accepting[q]
+                        solver.Add(x_vars[node.id][q] <= is_accepting[q])
+
+                    # If this node contains any rejected strings and the DFA is in state q,
+                    # then state q must be non-accepting
+                    if any(not outcome for outcome in node.outcomes):
+                        # x_vars[node.id][q] = 1 => is_accepting[q] = 0
+                        # This is equivalent to x_vars[node.id][q] <= (1 - is_accepting[q])
+                        solver.Add(x_vars[node.id][q] <= 1 - is_accepting[q])
+
+            # Recursively process children
+            for child in node.children.values():
+                add_final_constraints(child)
+
+        # 5. Dummy objective (feasibility only)
+        solver.Minimize(0)
+
+        status = solver.Solve()
+        if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
+            # Extract the transition function.
+            extracted_transitions = {}
+            for q in range(K):
+                for a in alphabet:
+                    for q2 in range(K):
+                        if T_vars[(q, a, q2)].solution_value() > 0.5:
+                            extracted_transitions[(q, a)] = q2
+                            break
+            extracted_accepting = {q for q in range(
+                K) if is_accepting[q].solution_value() > 0.5}
+            return extracted_transitions, extracted_accepting
         else:
-            solver.add(z3.Not(is_final[end_state]))
-
-    # Helper function to compute end state for a string
-    def compute_end_state(string):
-        # Start from initial state (0)
-        current = z3.IntVal(0)
-
-        # Process each symbol in the string
-        for symbol in string:
-            # Get index of the symbol in our alphabet
-            symbol_idx = alpha_to_idx[symbol]
-
-            # Create a new variable for the result of delta[current][symbol_idx]
-            # We use the Select operation to access an element of delta based on current
-            current = z3.Select(z3.Select(z3.K(z3.IntSort(), z3.IntSort(), z3.IntSort()),
-                                          current),
-                                z3.IntVal(symbol_idx))
-
-            # Add constraints to define this select operation for concrete values
-            for q in range(num_states):
-                solver.add(z3.Select(z3.Select(z3.K(z3.IntSort(), z3.IntSort(), z3.IntSort()),
-                                               z3.IntVal(q)),
-                                     z3.IntVal(symbol_idx)) == delta[q][symbol_idx])
-
-        return current
-
-    # Add constraints for accepting strings
-    for string in accepting:
-        add_string_constraints(string, True)
-
-    # Add constraints for rejecting strings
-    for string in rejecting:
-        add_string_constraints(string, False)
-
-    # Check for solution
-    start_time = time.time()
-    result = solver.check()
-    solve_time = time.time() - start_time
-
-    print(
-        f"Z3 solver finished in {solve_time:.2f} seconds with result: {result}")
-
-    if result == z3.sat:
-        model = solver.model()
-
-        # Extract the transition function
-        transitions = {}
-        for q in range(num_states):
-            transitions[q] = {}
-            for a_idx, a in enumerate(alphabet):
-                transitions[q][a] = model[delta[q][a_idx]].as_long()
-
-        # Extract the final states
-        final_states = set()
-        for q in range(num_states):
-            if model[is_final[q]] is not None and z3.is_true(model[is_final[q]]):
-                final_states.add(q)
-
-        return transitions, final_states
-
-    return None
-
-
-def solve_dfa_iterative(alphabet, accepting, rejecting, num_states, timeout=600):
-    """
-    A simpler approach that directly encodes the end state for each string.
-    """
-    print(
-        f"Attempting to find DFA with {num_states} states (timeout: {timeout}s)...")
-
-    # Set timeout for Z3
-    z3.set_param('timeout', timeout * 1000)  # in milliseconds
-
-    # Create solver
-    solver = z3.Solver()
-
-    # Create transition function
-    delta = {}
-    for q in range(num_states):
-        delta[q] = {}
-        for a_idx, a in enumerate(alphabet):
-            delta[q][a] = z3.Int(f"delta_{q}_{a}")
-            solver.add(delta[q][a] >= 0)
-            solver.add(delta[q][a] < num_states)
-
-    # Create final state variables
-    is_final = [z3.Bool(f"final_{q}") for q in range(num_states)]
-
-    # For each string, directly compute its end state using nested if-then-else expressions
-    for string in accepting:
-        if not string:
-            # Empty string - initial state must be accepting
-            solver.add(is_final[0])
-            continue
-
-        # For non-empty strings, compute end state directly
-        end_state_expr = z3.IntVal(0)  # Start with initial state
-        for symbol in string:
-            # Build a nested if-then-else to compute next state
-            ite_expr = z3.IntVal(0)  # Default
-            for q in range(num_states):
-                ite_expr = z3.If(end_state_expr == q,
-                                 delta[q][symbol], ite_expr)
-            end_state_expr = ite_expr
-
-        # Build final constraint as a big disjunction
-        constraint = z3.Or([z3.And(end_state_expr == q, is_final[q])
-                           for q in range(num_states)])
-        solver.add(constraint)
-
-    # Same for rejecting strings
-    for string in rejecting:
-        if not string:
-            # Empty string - initial state must be rejecting
-            solver.add(z3.Not(is_final[0]))
-            continue
-
-        # For non-empty strings, compute end state directly
-        end_state_expr = z3.IntVal(0)  # Start with initial state
-        for symbol in string:
-            # Build a nested if-then-else to compute next state
-            ite_expr = z3.IntVal(0)  # Default
-            for q in range(num_states):
-                ite_expr = z3.If(end_state_expr == q,
-                                 delta[q][symbol], ite_expr)
-            end_state_expr = ite_expr
-
-        # Build final constraint as a big disjunction
-        constraint = z3.Or(
-            [z3.And(end_state_expr == q, z3.Not(is_final[q])) for q in range(num_states)])
-        solver.add(constraint)
-
-    # Add symmetry breaking
-    for i in range(1, num_states):
-        used_i = z3.Or([delta[q][a] == i for q in range(i) for a in alphabet])
-
-        # If state i is not used, then no state > i should be used
-        if i < num_states - 1:
-            not_used_higher = z3.And([
-                z3.Not(z3.Or([delta[q][a] == j for q in range(i)
-                       for a in alphabet]))
-                for j in range(i+1, num_states)
-            ])
-            solver.add(z3.Implies(z3.Not(used_i), not_used_higher))
-
-    # Check for solution
-    start_time = time.time()
-    result = solver.check()
-    solve_time = time.time() - start_time
-
-    print(
-        f"Z3 solver finished in {solve_time:.2f} seconds with result: {result}")
-
-    if result == z3.sat:
-        model = solver.model()
-
-        # Extract the transition function
-        transitions = {}
-        for q in range(num_states):
-            transitions[q] = {}
-            for a in alphabet:
-                transitions[q][a] = model[delta[q][a]].as_long()
-
-        # Extract the final states
-        final_states = set()
-        for q in range(num_states):
-            if model[is_final[q]] is not None and z3.is_true(model[is_final[q]]):
-                final_states.add(q)
-
-        return transitions, final_states
-
-    return None
-
-
-def verify_dfa(alphabet, transitions, final_states, accepting, rejecting):
-    """
-    Verify that the constructed DFA correctly accepts/rejects all strings.
-    """
-    initial_state = 0
-    errors = []
-
-    # Check accepting strings
-    for string in accepting:
-        current_state = initial_state
-        for symbol in string:
-            if symbol not in alphabet:
-                errors.append(f"Symbol '{symbol}' not in alphabet")
-                continue
-            current_state = transitions[current_state][symbol]
-
-        if current_state not in final_states:
-            errors.append(
-                f"DFA incorrectly rejects accepting string: '{string}'")
-
-    # Check rejecting strings
-    for string in rejecting:
-        current_state = initial_state
-        for symbol in string:
-            if symbol not in alphabet:
-                errors.append(f"Symbol '{symbol}' not in alphabet")
-                continue
-            current_state = transitions[current_state][symbol]
-
-        if current_state in final_states:
-            errors.append(
-                f"DFA incorrectly accepts rejecting string: '{string}'")
-
-    return errors
-
-
-def visualize_dfa(alphabet, transitions, final_states, k):
-    """
-    Create a textual visualization of the DFA.
-    """
-    result = []
-    result.append("DFA Visualization:")
-    result.append(f"Number of states: {k}")
-    result.append(f"Initial state: 0")
-    result.append(f"Final states: {', '.join(map(str, sorted(final_states)))}")
-    result.append("\nTransition Table:")
-
-    header = "State | " + " | ".join(alphabet) + " |"
-    result.append(header)
-    result.append("-" * len(header))
-
-    for q in range(k):
-        state_marker = "*" if q in final_states else " "
-        row = f"{state_marker}{q:4d} | "
-        row += " | ".join(str(transitions[q][a]) for a in alphabet)
-        row += " |"
-        result.append(row)
-
-    return "\n".join(result)
-
-
-def generate_dot_file(alphabet, transitions, final_states, k, filename="dfa.dot"):
-    """
-    Generate a DOT file for visualization with Graphviz
-    """
-    with open(filename, 'w') as f:
-        f.write("digraph DFA {\n")
-        f.write("    rankdir=LR;\n")
-        f.write("    size=\"8,5\";\n")
-
-        # Mark the initial state
-        f.write("    node [shape = point]; qi;\n")
-
-        # Define all states
-        f.write("    node [shape = circle];\n")
-        for q in range(k):
-            if q in final_states:
-                f.write(f"    {q} [shape = doublecircle];\n")
-
-        # Initial state arrow
-        f.write(f"    qi -> 0;\n")
-
-        # Add transitions
-        for q in range(k):
-            for a in alphabet:
-                next_state = transitions[q][a]
-                f.write(f"    {q} -> {next_state} [label = \"{a}\"];\n")
-
-        f.write("}\n")
-
-    print(f"DOT file generated: {filename}")
-    print("To visualize, install Graphviz and run: dot -Tpng dfa.dot -o dfa.png")
-
-
-def run_dfa_on_string(alphabet, transitions, final_states, input_string):
-    """
-    Run the constructed DFA on a given input string and return if it's accepted.
-    """
-    current_state = 0  # Initial state
-    path = [current_state]
-
-    for symbol in input_string:
-        if symbol not in alphabet:
-            return False, f"Symbol '{symbol}' not in alphabet", path
-        current_state = transitions[current_state][symbol]
-        path.append(current_state)
-
-    return current_state in final_states, "Accepted" if current_state in final_states else "Rejected", path
+            print("No solution found.")
+            return None, None
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Automaton Identification Solver')
-    parser.add_argument('input_file', nargs='?',
-                        help='Path to the input data file')
-    parser.add_argument('--min-states', type=int, default=1,
-                        help='Minimum number of states to try')
-    parser.add_argument('--max-states', type=int,
-                        help='Maximum number of states to try (overrides file value)')
-    parser.add_argument('--timeout', type=int, default=600,
-                        help='Timeout in seconds for each state count')
-    parser.add_argument('--exact', type=int,
-                        help='Try only this exact number of states')
-    args = parser.parse_args()
+    start_time = time.time()
+    input_file = sys.argv[1] if len(sys.argv) > 1 else "data.txt"
+    alphabet, K, accepted, rejected = parse_input_file(input_file)
+    if alphabet is None:
+        return 1
 
-    # Get input file path
-    if args.input_file:
-        filepath = args.input_file
+    solver_instance = DFAConstructionSolver(alphabet, K, accepted, rejected)
+    transitions, accepting = solver_instance.solve_with_milp()
+
+    if transitions is not None and accepting is not None:
+        print("\n=== SOLUTION FOUND ===")
+        print("Transition Function:")
+        for (state, symbol), next_state in sorted(transitions.items()):
+            print(f"δ({state}, {symbol}) = {next_state}")
+        print("\nAccepting States:", sorted(accepting))
+        total_time = time.time() - start_time
+        print(f"\nTotal execution time: {total_time:.2f} seconds")
+        return 0
     else:
-        filepath = input("Enter the path to the data file: ")
-
-    try:
-        # Read data
-        alphabet, k_max, accepting, rejecting = read_data(filepath)
-
-        print(f"Alphabet: {alphabet}")
-        print(f"Maximum states from file: {k_max}")
-        if args.max_states:
-            print(f"Maximum states from command line: {args.max_states}")
-        print(f"Accepting strings: {accepting}")
-        print(f"Rejecting strings: {rejecting}")
-
-        print(
-            f"\nProcessing {len(accepting)} accepting strings and {len(rejecting)} rejecting strings...")
-
-        # If exact number of states is specified, only try that
-        if args.exact:
-            result = solve_dfa_iterative(
-                alphabet, accepting, rejecting, args.exact, args.timeout)
-
-            if result:
-                transitions, final_states = result
-                k = args.exact
-                print(f"\nSuccess! Found a DFA with {k} states.")
-
-                # Verify and display
-                errors = verify_dfa(alphabet, transitions,
-                                    final_states, accepting, rejecting)
-                if errors:
-                    print("\nWARNING: DFA verification failed!")
-                    for error in errors:
-                        print(f"  - {error}")
-                else:
-                    print(
-                        "Verification successful: DFA correctly handles all input strings.")
-
-                print("\n" + visualize_dfa(alphabet, transitions, final_states, k))
-                generate_dot_file(alphabet, transitions, final_states, k)
-
-                # Interactive mode
-                print(
-                    "\nInteractive mode: Test strings against the DFA (type 'exit' to quit)")
-                while True:
-                    test_string = input("\nEnter a string to test: ")
-                    if test_string.lower() == 'exit':
-                        break
-
-                    accepted, result_msg, path = run_dfa_on_string(
-                        alphabet, transitions, final_states, test_string)
-                    print(f"Result: {result_msg}")
-                    print(f"Path: {' -> '.join(map(str, path))}")
-            else:
-                print(f"No solution found with exactly {args.exact} states.")
-            return
-
-        # Otherwise, try increasing number of states
-        min_states = args.min_states
-        max_states = args.max_states if args.max_states else k_max
-
-        for k in range(min_states, max_states + 1):
-            try:
-                # Try the iterative approach which should be more reliable
-                result = solve_dfa_iterative(
-                    alphabet, accepting, rejecting, k, args.timeout)
-
-                if result:
-                    transitions, final_states = result
-                    print(f"\nSuccess! Found a DFA with {k} states.")
-
-                    # Verify the DFA
-                    errors = verify_dfa(
-                        alphabet, transitions, final_states, accepting, rejecting)
-                    if errors:
-                        print("\nWARNING: DFA verification failed!")
-                        print(f"Found {len(errors)} errors. First 10:")
-                        for i, error in enumerate(errors[:10]):
-                            print(f"  - {error}")
-                        if len(errors) > 10:
-                            print(f"  ... and {len(errors) - 10} more errors")
-                    else:
-                        print(
-                            "Verification successful: DFA correctly handles all input strings.")
-
-                    # Display the DFA
-                    print("\n" + visualize_dfa(alphabet,
-                          transitions, final_states, k))
-
-                    # Output formal specification
-                    print("\nFormal DFA Specification:")
-                    print(f"Q = {{{', '.join(str(i) for i in range(k))}}}")
-                    print(f"Σ = {{{', '.join(alphabet)}}}")
-                    print(f"q₀ = 0")
-                    print(f"F = {{{', '.join(str(i) for i in final_states)}}}")
-                    print("δ (transition function):")
-                    for q in range(k):
-                        for a in alphabet:
-                            print(f"  δ({q}, {a}) = {transitions[q][a]}")
-
-                    # Generate DOT file
-                    generate_dot_file(alphabet, transitions, final_states, k)
-
-                    # Interactive mode
-                    print(
-                        "\nInteractive mode: Test strings against the DFA (type 'exit' to quit)")
-                    while True:
-                        test_string = input("\nEnter a string to test: ")
-                        if test_string.lower() == 'exit':
-                            break
-
-                        accepted, result_msg, path = run_dfa_on_string(
-                            alphabet, transitions, final_states, test_string)
-                        print(f"Result: {result_msg}")
-                        print(f"Path: {' -> '.join(map(str, path))}")
-
-                    return
-            except Exception as e:
-                print(f"Error with {k} states: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print(f"\nNo solution found with up to {max_states} states.")
-        print("Suggestions:")
-        print("  1. Try increasing the maximum number of states")
-        print("  2. Check for contradictions in your example strings")
-        print("  3. Increase the timeout for the solver")
-        print("  4. Try just searching for the 8-state solution with --exact 8")
-
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print("\n=== NO SOLUTION FOUND ===")
+        return 1
 
 
 if __name__ == "__main__":
