@@ -88,9 +88,18 @@ def parse_input_file(input_file):
             else:
                 rejected.extend(valid_strings)
 
+        # Add some theoretical insights
+        min_theoretical_k = 1  # Default minimum
+        if accepted and rejected:
+            min_theoretical_k = 2  # With both accept and reject, minimum is 2
+
+            # For special case: empty string classification needs special handling
+            if "" in accepted or "" in rejected:
+                print("Note: Empty string included in classification set")
+
         print(f"\n=== Parsed Problem Instance ===")
         print(f"Alphabet: {alphabet}")
-        print(f"Maximum K: {K}")
+        print(f"Maximum K: {K} (will try from k={min_theoretical_k} to {K})")
         print(f"Accept strings: {len(accepted)}")
         print(f"Reject strings: {len(rejected)}")
         return alphabet, K, accepted, rejected
@@ -114,8 +123,12 @@ class DFAConstructionSolver:
         self.trie_root = build_trie(accept_strings, reject_strings)
 
     def solve_with_milp(self):
-        solver = pywraplp.Solver.CreateSolver(
-            'SCIP_MIXED_INTEGER_PROGRAMMING')
+        # Pre-check: For K=1, immediately return infeasible if both accept/reject strings exist
+        if self.max_states == 1 and self.accept_strings and self.reject_strings:
+            print("Infeasible: K=1 cannot handle both accepting and rejecting strings")
+            return None, None
+
+        solver = pywraplp.Solver.CreateSolver('SCIP_MIXED_INTEGER_PROGRAMMING')
         if not solver:
             print("MILP solver not available.")
             return None, None
@@ -205,29 +218,39 @@ class DFAConstructionSolver:
                                solver.Sum([y_vars[(parent_id, child_id, q, q2)] for q in range(K)]))
                 # Recursively add constraints for the child.
                 add_transition_constraints(child)
-        add_transition_constraints(self.trie_root)
 
-        # 4. Final-state constraints: For every trie node that is a leaf (has outcomes), enforce the outcome.
         def add_final_constraints(node):
             if node.outcomes:
+                # Check for conflicts in outcomes
+                has_accepting = any(outcome for outcome in node.outcomes)
+                has_rejecting = any(not outcome for outcome in node.outcomes)
+
+                if has_accepting and has_rejecting:
+                    # This node has conflicting outcomes - make the problem infeasible
+                    # This should never happen with properly formed data but acts as a safeguard
+                    print(f"Warning: Node {node.id} has conflicting outcomes")
+                    solver.Add(solver.Sum([1]) > K)  # Force infeasibility
+                    return
+
+                # Now add the appropriate constraints based on the outcomes
                 for q in range(K):
-                    # If this node contains any accepted strings and the DFA is in state q,
-                    # then state q must be accepting
-                    if any(outcome for outcome in node.outcomes):
-                        # x_vars[node.id][q] = 1 => is_accepting[q] = 1
-                        # This is equivalent to x_vars[node.id][q] <= is_accepting[q]
+                    # Only add constraint if DFA could be in this state (x_vars[node.id][q] > 0)
+                    # This ensures proper enforcement of acceptance/rejection
+                    if has_accepting:
+                        # If x_vars[node.id][q] = 1, then is_accepting[q] must = 1
                         solver.Add(x_vars[node.id][q] <= is_accepting[q])
 
-                    # If this node contains any rejected strings and the DFA is in state q,
-                    # then state q must be non-accepting
-                    if any(not outcome for outcome in node.outcomes):
-                        # x_vars[node.id][q] = 1 => is_accepting[q] = 0
-                        # This is equivalent to x_vars[node.id][q] <= (1 - is_accepting[q])
+                    if has_rejecting:
+                        # If x_vars[node.id][q] = 1, then is_accepting[q] must = 0
                         solver.Add(x_vars[node.id][q] <= 1 - is_accepting[q])
 
-            # Recursively process children
+            # Process all children
             for child in node.children.values():
                 add_final_constraints(child)
+
+        # IMPORTANT: Actually add the constraints to the solver!
+        add_transition_constraints(self.trie_root)
+        add_final_constraints(self.trie_root)
 
         # 5. Dummy objective (feasibility only)
         solver.Minimize(0)
@@ -253,24 +276,51 @@ class DFAConstructionSolver:
 def main():
     start_time = time.time()
     input_file = sys.argv[1] if len(sys.argv) > 1 else "data.txt"
-    alphabet, K, accepted, rejected = parse_input_file(input_file)
+    alphabet, max_K, accepted, rejected = parse_input_file(input_file)
     if alphabet is None:
         return 1
 
-    solver_instance = DFAConstructionSolver(alphabet, K, accepted, rejected)
-    transitions, accepting = solver_instance.solve_with_milp()
+    print(f"\n=== Starting Incremental Solver (k=2 to {max_K}) ===")
 
-    if transitions is not None and accepting is not None:
-        print("\n=== SOLUTION FOUND ===")
+    # Start trying from k=2 (since k=1 is trivially infeasible with mixed accept/reject strings)
+    best_solution = None
+    best_k = None
+
+    # Try each value of k from 2 to max_K
+    for k in range(2, max_K + 1):
+        print(f"\n--- Trying with k = {k} states ---")
+        k_start_time = time.time()
+
+        solver_instance = DFAConstructionSolver(
+            alphabet, k, accepted, rejected)
+        transitions, accepting = solver_instance.solve_with_milp()
+
+        k_time = time.time() - k_start_time
+        print(f"Time for k={k}: {k_time:.2f} seconds")
+
+        if transitions is not None and accepting is not None:
+            print(f"✓ Solution found with {k} states!")
+            best_solution = (transitions, accepting)
+            best_k = k
+            # Optional: Remove comment below to find the absolute minimum k
+            # by trying all values up to max_K instead of stopping at first solution
+            break
+
+    total_time = time.time() - start_time
+
+    if best_solution is not None:
+        transitions, accepting = best_solution
+        print(f"\n=== SOLUTION FOUND WITH {best_k} STATES ===")
         print("Transition Function:")
         for (state, symbol), next_state in sorted(transitions.items()):
             print(f"δ({state}, {symbol}) = {next_state}")
         print("\nAccepting States:", sorted(accepting))
-        total_time = time.time() - start_time
         print(f"\nTotal execution time: {total_time:.2f} seconds")
         return 0
     else:
-        print("\n=== NO SOLUTION FOUND ===")
+        print("\n=== NO SOLUTION FOUND FOR ANY K VALUE ===")
+        print(f"Tried all k values from 2 to {max_K}")
+        print(f"Total execution time: {total_time:.2f} seconds")
         return 1
 
 
