@@ -512,4 +512,3 @@ if __name__ == "__main__":
     exit_code = main()
     input("\nPress Enter to exit...")
     exit(exit_code)
-    exit(exit_code)
