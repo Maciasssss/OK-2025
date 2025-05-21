@@ -200,7 +200,6 @@ class DFAConstructionSolver:
 
         # Set solver parameters for better performance
         solver.SetNumThreads(8)
-        solver.SetTimeLimit(300000)  # 5 minutes
 
         K = self.max_states
         alphabet = self.alphabet
@@ -331,34 +330,34 @@ class DFAConstructionSolver:
 def main():
     start_time = time.time()
 
-    # Get input file path and optional k value from command line
+    # Get input file path from command line
     if len(sys.argv) < 2:
         print("No input file specified. Using default 'data.txt'.")
         input_file = "data.txt"
-        specific_k = None
-    elif len(sys.argv) == 2:
-        input_file = sys.argv[1]
-        specific_k = None
     else:
         input_file = sys.argv[1]
-        try:
-            specific_k = int(sys.argv[2])
-            if specific_k <= 0:
-                print(
-                    f"Warning: Invalid k value {specific_k}. K must be positive.")
-                print("Falling back to incremental mode.")
-                specific_k = None
-        except ValueError:
-            print(
-                f"Warning: Could not parse '{sys.argv[2]}' as an integer k value.")
-            print("Falling back to incremental mode.")
-            specific_k = None
 
     # Parse input file
     alphabet, max_K, accepted, rejected = parse_input_file(input_file)
     if alphabet is None:
         print("Exiting due to input file errors.")
         return 1
+
+    # Prompt user for specific k value or default to incremental mode
+    print(f"\nMaximum K value from input file: {max_K}")
+    user_input = input(
+        "Enter a specific k value to search (or press Enter to start incremental search): ").strip()
+
+    try:
+        specific_k = int(user_input) if user_input else None
+        if specific_k is not None and specific_k <= 0:
+            print(
+                f"Warning: Invalid k value {specific_k}. K must be positive.")
+            specific_k = None
+    except ValueError:
+        print(
+            f"Warning: Could not parse '{user_input}' as an integer k value.")
+        specific_k = None
 
     # Handle specific k value if provided
     if specific_k is not None:
@@ -414,7 +413,10 @@ def main():
     if best_solution is not None:
         transitions, accepting = best_solution
         print(f"\n=== SOLUTION FOUND WITH {best_k} STATES ===")
-        print("Transition Function:")
+
+        # Print a summary of the input strings again for easy reference
+        print("\n=== Input Summary ===")
+        print("\nTransition Function:")
         for (state, symbol), next_state in sorted(transitions.items()):
             print(f"δ({state}, {symbol}) = {next_state}")
         print("\nAccepting States:", sorted(accepting))
