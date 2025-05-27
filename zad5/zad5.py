@@ -1,6 +1,6 @@
-# zad5.py
 import sys
 import time
+from pathlib import Path
 
 
 class SuffixTreeNode:
@@ -132,7 +132,27 @@ if __name__ == '__main__':
     overall_start_time = time.perf_counter()
 
     input_read_start_time = time.perf_counter()
-    s = sys.stdin.readline().strip()
+    s = ""
+    try:
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).resolve().parent
+
+        input_file_path = base_path / "data.txt"
+
+        if not input_file_path.is_file():
+            print(
+                f"Error: Input file '{input_file_path}' not found. Please ensure 'data.txt' is in the same directory as the executable.", file=sys.stderr)
+            sys.exit(1)
+
+        with open(input_file_path, 'r', encoding='utf-8') as f:
+            s = f.readline().strip()
+    except Exception as e:
+        print(
+            f"Error reading input file '{input_file_path}': {e}", file=sys.stderr)
+        sys.exit(1)
+
     input_read_end_time = time.perf_counter()
 
     s_len = len(s)
@@ -140,7 +160,7 @@ if __name__ == '__main__':
     MAX_LEN = 5 * 10**5
     if s_len > MAX_LEN:
         print(
-            f"Error: Input string length {s_len} exceeds the maximum allowed length of {int(MAX_LEN)}.", file=sys.stderr)
+            f"Error: Input string length {s_len} (from data.txt) exceeds the maximum allowed length of {int(MAX_LEN)}.", file=sys.stderr)
         sys.exit(1)
 
     computation_start_time = time.perf_counter()
@@ -154,7 +174,7 @@ if __name__ == '__main__':
 
         if terminal_char in s:
             print(
-                f"Error: Terminal character '{terminal_char}' found in input string. Choose a different terminal.", file=sys.stderr)
+                f"Error: Terminal character '{terminal_char}' found in input string (from data.txt). Choose a different terminal.", file=sys.stderr)
             sys.exit(1)
 
         text_for_tree = s + s + terminal_char
@@ -180,3 +200,8 @@ if __name__ == '__main__':
     print(
         f"Total Execution: {overall_end_time - overall_start_time:.6f}", file=sys.stderr)
     print(f"-----------------------------", file=sys.stderr)
+
+    # Add this at the end to keep terminal window open for exe
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        print("\nPress Enter to exit...", file=sys.stderr)
+        input()

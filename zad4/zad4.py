@@ -201,7 +201,7 @@ if __name__ == "__main__":
     # For a quicker test, reduce num_candidates_to_sample, but you might not find the optimal.
     # num_candidates_to_sample = 100_000 # Faster, but might not find k=4
     # Should be enough to find k=4 with X0=215565119
-    num_candidates_to_sample = 5_000_0000000
+    num_candidates_to_sample = 5_000_0000
 
     k_sim, seed_sim = find_best_seed_via_simulation(
         num_candidates_to_sample=num_candidates_to_sample,
